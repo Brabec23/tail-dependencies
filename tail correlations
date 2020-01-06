@@ -1,0 +1,405 @@
+library(tidyquant)
+library(tidyverse)
+library(magrittr)
+library(lubridate)
+library(datatable)
+
+
+
+
+
+
+
+
+
+
+
+b <- compute_correlation("KO", "BAC", timing = "AnnMax", time = compute_timeframe("SPY"))
+
+# Volatilities and time frames of correlation
+
+compute_timeframe <- function(measure = "VIX"){
+  
+  if (measure == "VIX"){
+    VIX <- tq_get("VIX")
+    VIX <- VIX %>% select(date, adjusted) %>% tq_transmute(mutate_fun = to.monthly, col_rename = "Value") 
+    annual_max_vol <- VIX %>% mutate(Year = year(date)) %>% 
+      group_by(Year) %>% 
+      filter(Value == max(Value)) %>%
+      ungroup() 
+    
+    annual_max_vol %<>% mutate(Date = myd(paste0(annual_max_vol$date, '-01')))
+    annual_max_vol %<>% rename(Month = date) %>% select(Value, Date, Month, Year)      
+    
+    ordered_vol <- arrange(VIX, desc(Value)) %>% rename(Month = date) 
+    ordered_vol %<>% mutate(Date = as.Date(Month), Year = year(Month)) %>% select(Value, Date, Month, Year) 
+    max_vol <- ordered_vol %>% filter(Value == max(Value))
+    
+    out <- list(ordered_vol, annual_max_vol, max_vol, measure)
+    names(out) <- c("Annual maximums from high to low", "Annual maximums chronologically", "Absolute Max Month", "Symbol")
+    
+    return(out)
+    
+    
+    
+  } else if (is.xts(measure) | is.zoo(measure)){
+    ret <- measure
+    date_seq <- seq(index(ret)[1], index(ret)[length(ret)], by = "month")
+    
+    ret_by_month <- split(ret, f = "months")
+    monthly_sd <- sapply(ret_by_month, sd) %>% as.tibble()
+    diff <- nrow(monthly_sd) - length(date_seq)
+    if (diff != 0){date_seq <- append(date_seq, date_seq[length(date_seq)] %m+% months(1))}
+    monthly_sd$date <- date_seq
+    monthly_sd <- monthly_sd %>% mutate(Year = year(date), Value = value * sqrt(250))
+    
+    annual_max_vol <-  monthly_sd %>% 
+      group_by(Year) %>% 
+      filter(Value == max(Value, na.rm = TRUE)) %>%
+      ungroup() 
+    
+    annual_max_vol %<>% mutate(Month = as.yearmon(date)) 
+    day(annual_max_vol$date) <- 01 
+    annual_max_vol %<>% rename(Date = date)
+    annual_max_vol %<>% select(Value, Date, Month, Year)
+    
+    max_vol <- annual_max_vol %>% filter(Value == max(Value, na.rm = TRUE))
+    ordered_vol <- arrange(annual_max_vol, desc(Value))
+    
+    out <- list(ordered_vol, annual_max_vol, max_vol, measure)
+    names(out) <- c("Annual maximums from high to low", "Annual maximums chronologically", "Absolute Max Month", "Symbol")
+    
+    return(out)
+    
+    
+    
+    
+    
+  } else {
+    
+    ret <- NULL
+    tryCatch({ret <- getSymbols(measure, auto.assign = FALSE)[ ,6] %>% log() %>% diff() }
+             ,error = function(e){print("Give a valid ticker or time-series object of daily returns")})
+    
+    if (is.null(ret)){
+      cat("Computation not possible!")
+    } else {
+      
+      date_seq <- seq(index(ret)[1], index(ret)[length(ret)], by = "month")
+      
+      
+      ret_by_month <- split(ret, f = "months")
+      monthly_sd <- sapply(ret_by_month, sd) %>% as.tibble()
+      diff <- nrow(monthly_sd) - length(date_seq)
+      if (diff != 0){date_seq <- append(date_seq, date_seq[length(date_seq)] %m+% months(1))}
+      monthly_sd$date <- date_seq
+      monthly_sd <- monthly_sd %>% mutate(Year = year(date), Value = value * sqrt(250))
+      
+      annual_max_vol <-  monthly_sd %>% 
+        group_by(Year) %>% 
+        filter(Value == max(Value, na.rm = TRUE)) %>%
+        ungroup() 
+      
+      annual_max_vol %<>% mutate(Month = as.yearmon(date)) 
+      day(annual_max_vol$date) <- 01 
+      annual_max_vol %<>% rename(Date = date)
+      annual_max_vol %<>% select(Value, Date, Month, Year)
+      
+      max_vol <- annual_max_vol %>% filter(Value == max(Value, na.rm = TRUE))
+      ordered_vol <- arrange(annual_max_vol, desc(Value))
+      
+      out <- list(ordered_vol, annual_max_vol, max_vol, measure)
+      names(out) <- c("Annual maximums from high to low", "Annual maximums chronologically", "Absolute Max Month", "Symbol")
+      
+      return(out)
+      
+      
+    }
+  }
+}
+
+
+
+
+
+
+
+
+# CORRELATION
+
+compute_correlation <- function(direct_asset, indirect_asset, time = NULL, timing = c("AbsMax", "AnnMax", "MaxNativeCor"), names = NULL){
+  out <- NULL
+  if (("AbsMax" %in% timing | "AnnMax" %in% timing) && is.null(time)){
+    return(cat("Give time frame"))
+  }
+  
+#choosing times
+  if ("AbsMax" %in% timing | "AnnMax" %in% timing){
+    times <- sapply(time[-4], function(x) x$Date)
+    absmax <- times[[3]]
+    absmax_seq <- seq(absmax, bsts::LastDayInMonth(absmax), by = "day")
+    
+    annualmax <- times[[2]]
+    annualmax_seq <- sapply(annualmax, function(x) seq(x, bsts::LastDayInMonth(x), by = "day"))
+  }
+  
+  # 1 ABSMAX correlation  
+  if ("AbsMax" %in% timing){
+    timed1 <- NULL
+    for (asset in list(direct_asset, indirect_asset)){
+      
+      timed_ret <- NULL
+      ret1 <- NULL
+      #Price Symbol input
+      tryCatch( {ret1 <- getSymbols(asset, auto.assign = FALSE)[ ,6] %>% log() %>% diff() %>% na.omit()
+      timed_ret <- ret1[absmax_seq]}
+      ,error = function(e)NULL)
+      
+      #Return data input          
+      if (is.null(timed_ret) == TRUE){
+        if(is.tibble(asset) == TRUE | is.data.frame(asset) == TRUE){
+            tryCatch( {
+              for (i in 1:ncol(asset)){
+                if (is.Date(as.data.frame(asset)[ ,i]) == TRUE){
+                  asset %<>% rename_at(i,~"Date")
+                  break()
+                }
+              }
+              timed_ret <- asset %>% filter(Date %within% interval(absmax, bsts::LastDayInMonth(absmax))) %>% 
+                                                          select(Date, which(sapply(., class) == "numeric")) %>%
+                                                          select(1, 2)
+              if (ncol(asset) > 2){cat("For a return input, using the first numeric column as returns ")}
+            }
+            ,error = function(x)NULL)
+            
+            tryCatch({timed_ret <- timetk::tk_xts(timed_ret)}
+                     ,error = function(e){cat("Give return serie as dataframe, tibble, xts or zoo")})
+          
+        } else if (is.xts(asset) == TRUE | is.zoo(asset) == TRUE){ 
+          timed_ret <- asset[absmax_seq]
+        } else{
+          cat("Give returns as dataframe, tibble, xts or zoo object")
+        }
+        
+        
+     }
+      
+      timed1 <- merge.xts(timed1, timed_ret)
+    } 
+    
+    tryCatch( {MaxCorrelation <- cor(timed1[ ,1], timed1[ ,2])}
+              , error = function(x) cat("Data unavailable"))
+    
+    AbsMax <- unname(MaxCorrelation) %>% as.vector()
+    AbsMax <- tibble(Correlation = AbsMax, Year = time[[3]]$Year)
+    AbsMax <- list(AbsMax)
+    names(AbsMax) <- paste("Correlation during maximum",time[4],"volatility period")
+    out <- AbsMax
+    
+  } 
+    
+  
+  
+  # 2 ANNUALMAX Correlation
+  if ("AnnMax" %in% timing){
+    timed1 <- NULL
+    for (asset in list(direct_asset, indirect_asset)){
+      timed_ret <- NULL
+      ret1 <- NULL
+      #Price Symbol input
+      tryCatch( {
+        ret1 <- getSymbols(asset, auto.assign = FALSE)[ ,6] %>% log() %>% diff() %>% na.omit()
+        for (j in 1:length(annualmax_seq)){
+          timed_ret <- append(timed_ret, ret1[annualmax_seq[[j]]])
+        }
+       }
+        ,error = function(e) {NULL}
+      )
+      
+      
+      #Return data input          
+      if (is.null(timed_ret) == TRUE){
+        if(is.tibble(asset) == TRUE | is.data.frame(asset) == TRUE){
+          tryCatch( {
+            for (i in 1:ncol(asset)){
+              if (is.Date(as.data.frame(asset)[ ,i]) == TRUE){
+                asset %<>% rename_at(i,~"Date")
+                break()
+              }
+            }
+                for (i in 1:length(annualmax)){
+                  timed_ret <- append(timed_ret, asset %>% filter(Date %within% interval(annualmax[i], bsts::LastDayInMonth(annualmax[i]))))  
+                }
+                  timed_ret %<>% select(Date, which(sapply(., class) == "numeric")) %>%
+                  select(1, 2)
+                if (ncol(asset) > 2){cat("For a return input, using the first numeric column as returns ")}}
+              ,error = function(x){NULL})
+        
+          tryCatch({timed_ret <- timetk::tk_xts(timed_ret)}
+                   ,error = function(e){cat("Give return serie as dataframe, tibble, xts or zoo")})
+          
+            } else if (is.xts(asset) == TRUE | is.zoo(asset) == TRUE){ 
+              timed_ret <- asset[absmax_seq]
+            } else{
+              cat("Give returns as dataframe, tibble, xts or zoo object")
+            }
+      }
+      
+      #combining timed returns
+      timed1 <- merge.xts(timed1, timed_ret)
+    }  
+    
+    # Correlation calculations
+    timed1 <- split(timed1, f = "years") 
+    Correlation <- sapply(timed1, function(x) cor(x[ ,1], x[, 2]))
+    AnnMaxCorrelations <- tibble(Correlation, Year = year(times[[2]]))
+    Ann <- spread(AnnMaxCorrelations, key="Year", value = "Correlation")
+    rownames(Ann) <- "Correlations"
+    
+    #Maximum correlation from annual volatility maximums
+    Abs <- AnnMaxCorrelations %>% filter(Correlation == max(Correlation))
+    results <- list(Ann, Abs)
+    names(results) <- c(paste("Correlations during annual Max",time[4], "-volatility periods"), paste("Max correlation from annual max",time[4], "-volatilities"))
+    out <- append(out, results)
+  } 
+  
+  
+  
+  if ("MaxNativeCor" %in% timing){
+    asset <- NULL
+    
+    results <- NULL
+    ret <- NULL
+    
+    i <- 0
+    for (asset in list(direct_asset, indirect_asset)){
+      rt <- NULL
+      i <- i+1
+      tryCatch({rt <- tq_get(asset) %>% select(date, adjusted)
+      rt <- rt %>% mutate(return = c(0, diff(log(rt$adjusted)))) %>% select(-"adjusted")}
+      , error = function(e) {NULL})
+      
+      
+      if (is.null(rt) == TRUE){
+        if(is_tibble(asset) == TRUE | is.data.frame(asset) == TRUE){
+          tryCatch( {
+            for (j in 1:ncol(asset)){
+              if (is.Date(as.data.frame(asset)[ ,j]) == TRUE){
+                asset %<>% rename_at(j,~"date")
+                break()
+              }
+            }
+            rt <- asset %>% select(date, which(sapply(., class) == "numeric")) %>% select(1, 2)
+          }, error = function(e){cat("Couldnt find the date column or value column/n")})
+          
+        } else {
+          cat("Give tibble or dataframe with date column")
+        }
+      }
+      ret[[i]] <- rt
+      
+    }
+    
+    
+    rets <- inner_join(ret[[1]], ret[[2]], by = c("date"))
+    if (!is.null(names)){
+      colnames(rets) <- c("date", assets)
+    } else {
+      tryCatch({colnames(rets) <- c("date", assets)}, error = function(e) {"Asset names unavailable"})
+    }  
+    rets_by_month <- split(rets, format(rets$date, "%Y-%m"))
+    correlations <- map(rets_by_month, function(x) cor(x[2], x[3]))
+    
+    
+    
+    correlations <- unlist(correlations)
+    date <- names(correlations)
+    date <- as.Date(paste0(date, "-01"))
+    cor <- unname(correlations)
+    dat <- data.frame(date, cor)
+    data <- split(dat, format(dat$date, "%Y"))
+    ann_max_native <- map(data, function(x) x[which.max(x[ ,2]),c(1,2)]) %>% unname() %>% bind_rows()
+    abs_max_native <- dat %>% filter(cor == max(dat$cor, na.rm = TRUE))
+    
+    results <- list(abs_max_native, ann_max_native)
+    names(results) <- c("Native max correlation between assets", "Native annual max correlations between assets")
+    out <- append(out, results)
+  }
+  return(out)
+}
+
+
+
+###############################################################################
+# function to define the date column
+name_date <- function(asset){
+  for (i in 1:ncol(asset)){
+    if (is.Date(as.data.frame(asset)[ ,i])){
+      asset <<- rename_at(i,~"Date")
+      break()
+    }
+  }
+}
+#############################################################################
+
+
+
+# A simplified way to pull out volatilities and correlations
+
+
+rol_vol <- function(ticker = NULL, rollN = 30, nature = "ave", ret = NULL, start = NULL, end = NULL){
+  
+  if (is.null(ticker)&is.null(ret)){
+    stop("Give ticker or return data")
+  }
+  
+  if (is.null(ret)){
+   ret <- getSymbols(ticker, auto.assign = FALSE)[ ,6] %>% log() %>% diff()
+  }
+  
+  ret_sd <- runSD(ret, n = 30, sample = TRUE, cumulative = FALSE) %>% window(start = start, end = end) %>% na.omit() * sqrt(250)
+  
+  sd_by_year <- split(ret_sd, f = "years") %>% na.omit()
+  
+  volatility_by_year <- map(sd_by_year, function(x) data.frame(date=index(x), volatility = coredata(x)))
+  names(volatility_by_year) <- map(volatility_by_year, function(x) year(x$date[1]))
+  annual_max_vol <- map(volatility_by_year, function(x) filter(x, volatility == max(x$volatility, na.rm = TRUE))) %>% bind_rows()
+  
+  if (nature == "absmax"){
+    absmax_vol <- annual_max_vol %>% filter(volatility == max(annual_max_vol$volatility))
+    return(absmax_vol)
+    
+  } else if (nature == "annmax"){
+    return(annual_max_vol)  
+    
+  } else if (nature == "ann_ave"){
+    return(mean(annual_max_vol$volatility))
+    
+  } else if (nature == "ave"){
+    return(mean(ret_sd))
+  
+  } else {
+    cat("Argument nature is mistaken. Choose absmax, annmax, ann_av or ave")
+  }
+}
+
+
+
+
+rol_cor <- function(direct_asset = NULL, indirect_asset = NULL, roll_n = 30, rets = NULL, start = NULL, end = NULL){
+  
+  if (is.null(ticker)&is.null(ret)){
+    stop("Give ticker or return data")
+  }
+  
+  if (is.null(rets)){
+    x <- getSymbols(direct_asset, auto.assign = FALSE)[ ,6] %>% log() %>% diff()
+    y <- getSymbols(indirect_asset, auto.assign = FALSE)[ ,6] %>% log() %>% diff()
+  }
+    
+    rets <- data.frame(x,y) %>% na.omit()
+  x <- runCor(rets[1], rets[2], n = 30) %>% window(start = NULL, end = NULL) %>% na.omit() %>% max()
+  return(x)
+}
+
+
